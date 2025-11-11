@@ -7,7 +7,8 @@ import os
 import io
 import sys
 import gc
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 # Optimizaciones de memoria para PyInstaller
@@ -30,8 +31,6 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-
-
 
 # Colores para rosa de vientos
 COLORES_BLUES = ['#08306b', '#08519c', '#3182bd', '#6baed6', '#9ecae1', '#c6dbef', '#deebf7', '#f7fbff']
@@ -126,9 +125,16 @@ def get_column_unit(column_name: str) -> str:
         'co2': 'ppm', 'carbon dioxide': 'ppm',
         'evaporation': 'mm',
         'ph': '',
-        'ec': 'mS/cm', 'electrical conductivity': 'mS/cm',
+        'ec': 'mS/cm',  # Unidad específica para EC
+        'electrical conductivity': 'mS/cm',
+        'conductivity': 'mS/cm',
+        'conductividad': 'mS/cm',
         'salinity': 'ppm',
     }
+    
+    # Buscar coincidencia exacta primero para EC
+    if col_lower == 'ec':
+        return 'mS/cm'
     
     for key, unit in unit_map.items():
         if key in col_lower:
@@ -143,6 +149,159 @@ def format_column_label_with_unit(column_name: str) -> str:
     if unit:
         return f"{column_name} ({unit})"
     return column_name
+
+
+def identificar_columnas_meteorologicas(df: pd.DataFrame) -> dict:
+    """
+    Identifica automáticamente las columnas meteorológicas basándose en palabras clave.
+    
+    Retorna:
+    --------
+    dict: Diccionario con títulos descriptivos como clave y nombres de columnas como valores.
+    """
+    columnas_identificadas = {}
+    columnas_usadas = set()  # Para evitar que una columna se use múltiples veces
+    
+    # Mapeo de títulos a palabras clave de búsqueda (ordenadas de más específicas a menos específicas)
+    mapeo_titulos = {
+        # Primero las más específicas que contienen "soil" o términos específicos
+        "Temperatura de suelo": ["soil temperature", "soil temp", "temperatura suelo"],
+        "Humedad del suelo": ["soil humidity", "soil moisture", "humedad suelo"],
+        "Ph del suelo": ["PH", "ph suelo","ph"],
+        "Salinidad del suelo": ["Salinity", "salinidad suelo","salinity"],
+        "Direccion del viento": ["wind direction", "direccion viento", "direccion", "wind_dir"],
+        # Luego las atmosféricas y otras
+        "Temperatura atmosférica": ["air temperature", "temperatura atmosferica", "temperature", "temperatura", "temp"],
+        "Humedad atmosférica": ["air humidity", "humedad atmosferica", "humidity", "humedad"],
+        "Presión atmosférica": ["air pressure", "presion atmosferica", "pressure", "presion"],
+        "Velocidad de viento": ["wind speed", "velocidad viento", "velocidad", "speed"],
+        "Radiación UV": ["uv radiation", "radiacion uv", "uv index", "uv"],
+        "Evaporación": ["evaporation", "evaporacion"],
+        "Lluvia": ["rain", "lluvia", "precipitation", "precipitacion"],
+        "Piranómetro": ["pyranometer", "piranometro", "solar radiation", "radiacion solar"],
+        "Medición de dióxido de carbono": ["carbon dioxide", "dioxido de carbono", "co2"],
+        # Conductividad general (solo si no se encontró específica de suelo)
+        "Conductividad del suelo   ": ["ec", "electrical conductivity", "conductivity", "conductividad"],
+        "Indice uv": ["uv index", "indice uv", "uv_index"],
+    }
+    
+    # Buscar columnas que coincidan con cada categoría
+    # Procesar en el orden del diccionario (las más específicas primero)
+    for titulo, keywords in mapeo_titulos.items():
+        if titulo in columnas_identificadas:
+            continue  # Ya encontramos esta columna
+        
+        mejor_coincidencia = None
+        mejor_score = 0
+        
+        for col in df.columns:
+            if col in columnas_usadas:
+                continue  # Esta columna ya fue asignada
+            
+            col_lower = col.lower().strip()
+            
+            # Verificar que sea numérica
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            
+            # Calcular score de coincidencia (keywords más específicas tienen mayor prioridad)
+            # Las primeras keywords en la lista son las más específicas
+            for i, keyword in enumerate(keywords):
+                if keyword in col_lower:
+                    # Score inverso: las primeras keywords (más específicas) tienen mayor score
+                    score = len(keywords) - i
+                    if score > mejor_score:
+                        mejor_score = score
+                        mejor_coincidencia = col
+                    break
+        
+        # Si encontramos una buena coincidencia, asignarla
+        if mejor_coincidencia and mejor_score > 0:
+            columnas_identificadas[titulo] = mejor_coincidencia
+            columnas_usadas.add(mejor_coincidencia)
+    
+    # Limpiar "Conductividad" general si ya tenemos "Conductividad del suelo"
+    if "Conductividad del suelo" in columnas_identificadas and "Conductividad" in columnas_identificadas:
+        # Verificar si son la misma columna
+        if columnas_identificadas["Conductividad del suelo"] == columnas_identificadas["Conductividad"]:
+            del columnas_identificadas["Conductividad"]
+    
+    return columnas_identificadas
+
+
+def crear_grafica_individual(
+    df: pd.DataFrame,
+    date_col: str,
+    column_name: str,
+    titulo: str
+) -> Optional[go.Figure]:
+    """
+    Crea una gráfica individual para una columna específica.
+    
+    Parámetros:
+    -----------
+    df : pd.DataFrame
+        DataFrame con los datos
+    date_col : str
+        Nombre de la columna de fecha
+    column_name : str
+        Nombre de la columna a graficar
+    titulo : str
+        Título de la gráfica
+        
+    Retorna:
+    --------
+    fig : plotly.graph_objects.Figure o None
+        Figura de Plotly con la gráfica, o None si no hay datos
+    """
+    if column_name not in df.columns:
+        return None
+    
+    # Filtrar datos válidos
+    datos_validos = df[[date_col, column_name]].dropna(subset=[column_name])
+    
+    if datos_validos.empty:
+        return None
+    
+    # Crear gráfica
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=datos_validos[date_col],
+        y=datos_validos[column_name],
+        mode='lines',
+        name=column_name,
+        line=dict(width=2),
+        hovertemplate='<b>Fecha:</b> %{x}<br>' +
+                      f'<b>{titulo}:</b> %{{y}}<br>' +
+                      '<extra></extra>'
+    ))
+    
+    # Obtener unidad
+    unit = get_column_unit(column_name)
+    yaxis_title = titulo
+    if unit:
+        yaxis_title += f" ({unit})"
+    
+    # Configurar layout
+    fig.update_layout(
+        title={
+            'text': titulo,
+            'x': 0.5,
+            'xanchor': 'center',
+            'font': {'size': 14}
+        },
+        xaxis_title="Fecha",
+        yaxis_title=yaxis_title,
+        height=300,
+        hovermode='x unified',
+        showlegend=False,
+        margin=dict(l=40, r=20, t=40, b=40),
+        xaxis=dict(showgrid=True, gridwidth=1, gridcolor='lightgray'),
+        yaxis=dict(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    )
+    
+    return fig
 
 
 def export_dataframe(
@@ -163,7 +322,135 @@ def export_dataframe(
     return out_path
 
 
+def generar_todas_las_graficas(df_filtered: pd.DataFrame, date_col: str, start_date, end_date) -> dict:
+    """
+    Genera todas las gráficas disponibles en la aplicación.
     
+    Retorna:
+    --------
+    dict: Diccionario con nombres de archivo y bytes de las imágenes
+    """
+    graficas = {}
+    
+    try:
+        # Verificar si kaleido está disponible
+        try:
+            import kaleido
+            KALEIDO_AVAILABLE = True
+            engine = "kaleido"
+        except ImportError:
+            KALEIDO_AVAILABLE = False
+            engine = "auto"
+            st.warning("⚠️ Para mejor calidad de imágenes, instala: pip install kaleido")
+        
+        # 1. Gráfica combinada de todas las variables - USAR plotly.graph_objects EN VEZ DE plotly.express
+        numeric_cols = [col for col in df_filtered.columns[1:] if pd.api.types.is_numeric_dtype(df_filtered[col])]
+        if numeric_cols:
+            # Crear gráfica combinada con plotly.graph_objects para mejor compatibilidad
+            fig_combinada = go.Figure()
+            
+            # Paleta de colores para las líneas
+            colores = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                      '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+            
+            for i, col in enumerate(numeric_cols):
+                datos_validos = df_filtered[[date_col, col]].dropna(subset=[col])
+                if not datos_validos.empty:
+                    color_idx = i % len(colores)
+                    nombre_serie = format_column_label_with_unit(col)
+                    
+                    fig_combinada.add_trace(go.Scatter(
+                        x=datos_validos[date_col],
+                        y=datos_validos[col],
+                        mode='lines',
+                        name=nombre_serie,
+                        line=dict(color=colores[color_idx], width=2),
+                        hovertemplate=f'<b>Fecha:</b> %{{x}}<br><b>{nombre_serie}:</b> %{{y}}<extra></extra>'
+                    ))
+            
+            if len(fig_combinada.data) > 0:
+                fig_combinada.update_layout(
+                    title=f"📊 Datos de Estación Meteorológica - {len(numeric_cols)} variables",
+                    xaxis_title="Fecha",
+                    yaxis_title="Valor",
+                    height=600,
+                    hovermode='x unified',
+                    legend=dict(
+                        orientation="v",
+                        yanchor="top",
+                        y=1,
+                        xanchor="left",
+                        x=1.02
+                    ),
+                    showlegend=True
+                )
+                
+                # Convertir a imagen
+                try:
+                    img_bytes = fig_combinada.to_image(format="png", width=1200, height=600, engine=engine)
+                    graficas["01_grafica_combinada.png"] = img_bytes
+                except Exception as e:
+                    st.error(f"Error al generar gráfica combinada: {e}")
+        
+        # 2. Gráficas individuales
+        columnas_meteo = identificar_columnas_meteorologicas(df_filtered)
+        if not columnas_meteo:
+            # Usar todas las columnas numéricas si no se identifican automáticamente
+            for i, col in enumerate(numeric_cols, 2):
+                titulo_col = format_column_label_with_unit(col)
+                fig_individual = crear_grafica_individual(df_filtered, date_col, col, titulo_col)
+                if fig_individual:
+                    try:
+                        img_bytes = fig_individual.to_image(format="png", width=800, height=400, engine=engine)
+                        nombre_archivo = f"{i:02d}_grafica_{col.lower().replace(' ', '_')}.png"
+                        graficas[nombre_archivo] = img_bytes
+                    except Exception as e:
+                        st.error(f"Error al generar gráfica individual {col}: {e}")
+        else:
+            for i, (titulo, col_name) in enumerate(columnas_meteo.items(), 2):
+                fig_individual = crear_grafica_individual(df_filtered, date_col, col_name, titulo)
+                if fig_individual:
+                    try:
+                        img_bytes = fig_individual.to_image(format="png", width=800, height=400, engine=engine)
+                        nombre_archivo = f"{i:02d}_grafica_{titulo.lower().replace(' ', '_')}.png"
+                        graficas[nombre_archivo] = img_bytes
+                    except Exception as e:
+                        st.error(f"Error al generar gráfica individual {titulo}: {e}")
+        
+        # 3. Rosa de vientos (si hay datos de dirección)
+        posibles_direcciones = [c for c in df_filtered.columns if any(term in c.lower() for term in 
+                                                                     ['direccion', 'direction', 'wind direction', 'wind_dir'])]
+        if posibles_direcciones:
+            columna_direccion = posibles_direcciones[0]
+            direcciones = df_filtered[columna_direccion].dropna().copy()
+            
+            if not direcciones.empty:
+                # Aplicar rotación de 180°
+                direcciones = (direcciones - 180) % 360
+                
+                # Buscar velocidad
+                posibles_velocidades = [c for c in df_filtered.columns if any(term in c.lower() for term in 
+                                                                             ['velocidad', 'speed', 'wind speed', 'wind_speed'])]
+                velocidades = None
+                if posibles_velocidades:
+                    velocidades = df_filtered[posibles_velocidades[0]]
+                
+                try:
+                    fig_rosa = crear_rosa_vientos(
+                        direcciones=direcciones,
+                        velocidades=velocidades,
+                        titulo=f"Rosa de Vientos\n{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+                    )
+                    
+                    img_bytes = fig_rosa.to_image(format="png", width=800, height=600, engine=engine)
+                    graficas["99_rosa_de_vientos.png"] = img_bytes
+                except Exception as e:
+                    st.error(f"Error al generar rosa de vientos: {e}")
+    
+    except Exception as e:
+        st.error(f"Error general al generar gráficas: {e}")
+    
+    return graficas
 
 
 # ============================================================================
@@ -501,22 +788,31 @@ def main() -> None:
     min_date = valid_dates.min().date()
     max_date = valid_dates.max().date()
     
-    # Filtros de fecha
+    # Filtros de fecha - MEJORADO: Añadir un día más a la fecha máxima
     st.subheader("📅 Filtros de Fecha")
     col_a, col_b = st.columns(2)
     with col_a:
         start_date = st.date_input("Fecha inicio", value=min_date, min_value=min_date, max_value=max_date)
     with col_b:
-        end_date = st.date_input("Fecha fin", value=max_date, min_value=min_date, max_value=max_date)
+        # Calcular fecha fin por defecto (máxima detectada + 1 día)
+        default_end_date = max_date + timedelta(days=1)
+        end_date = st.date_input(
+            "Fecha fin", 
+            value=default_end_date, 
+            min_value=min_date, 
+            max_value=default_end_date
+        )
     
     if start_date > end_date:
         st.error("❌ La fecha de inicio no puede ser mayor que la fecha fin.")
         st.stop()
     
+    # Aplicar filtro - incluir datos hasta el final del día seleccionado
     mask = (df_dt[date_col] >= pd.to_datetime(start_date)) & (df_dt[date_col] <= pd.to_datetime(end_date))
     df_filtered = df_dt.loc[mask].copy()
     
     st.success(f"✅ Filas después de filtrar: {len(df_filtered):,} de {len(df):,} totales")
+    st.info(f"📊 Rango seleccionado: {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}")
     
     # Crear índice UV si existe
     try:
@@ -576,6 +872,70 @@ def main() -> None:
                 )
             )
             st.plotly_chart(fig, use_container_width=True)
+            
+            # SECCIÓN DE GRÁFICAS INDIVIDUALES (movida desde Rosa de Vientos)
+            st.subheader("📊 Gráficas Individuales por Variable")
+            
+            # Identificar columnas meteorológicas automáticamente
+            columnas_meteo = identificar_columnas_meteorologicas(df_filtered)
+            
+            if not columnas_meteo:
+                st.info("ℹ️ No se identificaron columnas meteorológicas automáticamente.")
+                # Si no se identifican automáticamente, usar todas las columnas numéricas
+                numeric_cols = [c for c in df_filtered.columns[1:] if pd.api.types.is_numeric_dtype(df_filtered[c])]
+                for col in numeric_cols:
+                    titulo_col = format_column_label_with_unit(col)
+                    with st.expander(f"📈 {titulo_col}", expanded=False):
+                        fig_individual = crear_grafica_individual(
+                            df_filtered,
+                            date_col,
+                            col,
+                            titulo_col
+                        )
+                        if fig_individual:
+                            st.plotly_chart(fig_individual, use_container_width=True)
+                        else:
+                            st.warning("No hay datos válidos para esta variable.")
+            else:
+                # Orden de visualización deseado
+                orden_titulos = [
+                    "Velocidad de viento",
+                    "Temperatura atmosférica",
+                    "Radiación UV",
+                    "Evaporación",
+                    "Lluvia",
+                    "Humedad atmosférica",
+                    "Presión atmosférica",
+                    "Ph del suelo",
+                    "Salinidad del suelo",
+                    "Conductividad del suelo",
+                    "Humedad del suelo",
+                    "Temperatura de suelo",
+                    "Piranómetro",
+                    "Medición de dióxido de carbono"
+                ]
+                
+                # Filtrar solo los títulos que están en columnas_meteo y mantener el orden
+                titulos_disponibles = [t for t in orden_titulos if t in columnas_meteo]
+                
+                # Agregar cualquier otra columna identificada que no esté en la lista
+                otros_titulos = [t for t in columnas_meteo.keys() if t not in orden_titulos]
+                titulos_disponibles.extend(otros_titulos)
+                
+                # Mostrar gráficas en expanders
+                for titulo in titulos_disponibles:
+                    col_name = columnas_meteo[titulo]
+                    with st.expander(f"📈 {titulo}", expanded=False):
+                        fig_individual = crear_grafica_individual(
+                            df_filtered,
+                            date_col,
+                            col_name,
+                            titulo
+                        )
+                        if fig_individual:
+                            st.plotly_chart(fig_individual, use_container_width=True)
+                        else:
+                            st.warning("No hay datos válidos para esta variable.")
     
     # ========================================================================
     # PESTAÑA 2: ROSA DE VIENTOS
@@ -600,16 +960,17 @@ def main() -> None:
         if not posibles_velocidades:
             posibles_velocidades = [c for c in df_filtered.columns[1:] if pd.api.types.is_numeric_dtype(df_filtered[c])]
         
-        col1, col2 = st.columns(2)
+        # Configuración de rosa de vientos
+        col_config1, col_config2 = st.columns(2)
         
-        with col1:
+        with col_config1:
             columna_direccion = st.selectbox(
                 "Columna de Dirección del Viento (°)",
                 options=posibles_direcciones,
                 help="Selecciona la columna con dirección del viento (0-360°)"
             )
         
-        with col2:
+        with col_config2:
             usar_velocidad = st.checkbox("Usar velocidad del viento", value=len(posibles_velocidades) > 0)
             if usar_velocidad:
                 columna_velocidad = st.selectbox(
@@ -627,8 +988,6 @@ def main() -> None:
             st.error("❌ No hay datos válidos de dirección del viento")
         else:
             # Aplicar rotación de 180° automáticamente
-            # Rotar 180°: (dirección - 180) % 360
-            # Esto maneja automáticamente los valores negativos sumándoles 360°
             direcciones = (direcciones - 180) % 360
             st.info(f"🔄 Direcciones rotadas automáticamente 180°. Ejemplo: 90° → {(90 - 180) % 360}°, 270° → {(270 - 180) % 360}°")
             
@@ -638,18 +997,18 @@ def main() -> None:
             
             # Estadísticas
             st.subheader("📊 Estadísticas")
-            col3, col4, col5 = st.columns(3)
-            with col3:
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+            with col_stat1:
                 st.metric("Registros válidos", len(direcciones))
-            with col4:
+            with col_stat2:
                 st.metric("Dirección promedio", f"{direcciones.mean():.1f}°")
-            with col5:
+            with col_stat3:
                 if velocidades is not None:
                     velocidades_validas = velocidades.dropna()
                     if not velocidades_validas.empty:
                         st.metric("Velocidad promedio", f"{velocidades_validas.mean():.2f} m/s")
             
-            # Crear rosa de vientos
+            # Solo rosa de vientos en esta pestaña
             try:
                 titulo_grafica = "Rosa de Vientos - Estación Meteorológica"
                 if len(df_filtered) < len(df):
@@ -680,7 +1039,7 @@ def main() -> None:
     
     st.subheader("💾 Descargar Datos Filtrados")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         csv_data = df_filtered.to_csv(index=False, encoding="utf-8-sig")
@@ -706,8 +1065,40 @@ def main() -> None:
             )
         except Exception as e:  # noqa: BLE001
             st.error(f"Error al preparar Excel: {e}")
+    
+    with col3:
+        # Botón para descargar todas las imágenes
+        if st.button("🖼️ Descargar Todas las Imágenes", use_container_width=True):
+            with st.spinner("Generando imágenes..."):
+                try:
+                    # Generar todas las gráficas
+                    todas_graficas = generar_todas_las_graficas(df_filtered, date_col, start_date, end_date)
+                    
+                    if todas_graficas:
+                        # Crear archivo ZIP
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                            for nombre_archivo, imagen_bytes in todas_graficas.items():
+                                zip_file.writestr(nombre_archivo, imagen_bytes)
+                        
+                        zip_buffer.seek(0)
+                        
+                        # Botón de descarga
+                        st.download_button(
+                            label=f"📦 Descargar ZIP con {len(todas_graficas)} imágenes",
+                            data=zip_buffer,
+                            file_name=f"graficas_meteorologicas_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.zip",
+                            mime="application/zip",
+                            use_container_width=True
+                        )
+                        
+                        st.success(f"✅ Se generaron {len(todas_graficas)} imágenes")
+                    else:
+                        st.warning("⚠️ No se pudieron generar imágenes")
+                        
+                except Exception as e:
+                    st.error(f"❌ Error al generar imágenes: {e}")
 
 
 if __name__ == "__main__":
     main()
-
